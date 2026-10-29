@@ -80,26 +80,27 @@ def which(cmd):
     refresh_path()
     return shutil.which(cmd)
 
-# ---------- Обрезка длинных строк ----------
+# ---------- Обрезка ----------
 
 def clip(s, limit, *, head=True):
-    if s is None:
-        return s
-    if not isinstance(s, str):
-        s = str(s)
+    if s is None: return s
+    if not isinstance(s, str): s = str(s)
     total = len(s)
-    if total <= limit:
-        return s
+    if total <= limit: return s
     marker = f"... [{total} chars]"
-    if head:
-        return s[:limit] + marker
+    if head: return s[:limit] + marker
     return marker + s[-limit:]
 
+def smart_clip(s, limit):
+    if s is None: return s
+    if not isinstance(s, str): s = str(s)
+    if len(s) <= limit: return s
+    half = limit // 2
+    return s[:half] + f"\n\n... [ПРОПУЩЕНО {len(s) - limit} СИМВОЛОВ] ...\n\n" + s[-half:]
+
 def _env_int(name, default):
-    try:
-        return int(os.environ.get(name, default))
-    except Exception:
-        return default
+    try: return int(os.environ.get(name, default))
+    except Exception: return default
 
 LIMIT_READ_FILE      = _env_int("GIGA_LIMIT_READ_FILE", 20000)
 LIMIT_SHELL_OUT      = _env_int("GIGA_LIMIT_SHELL_OUT", 20000)
@@ -115,13 +116,14 @@ TOOL_SCHEMA = [
     {"name": "read_file", "args": {"path": "string"}},
     {"name": "write_file", "args": {"path": "string", "content": "string"}},
     {"name": "append_file", "args": {"path": "string", "content": "string"}},
-    {"name": "insert_inside_class", "args": {"path": "string", "content": "string"}}, # НОВЫЙ ИНСТРУМЕНТ
+    {"name": "insert_inside_class", "args": {"path": "string", "content": "string"}},
     {"name": "edit_file", "args": {"path": "string", "old": "string", "new": "string"}},
     {"name": "list_dir", "args": {"path": "string"}},
     {"name": "run_shell", "args": {"command": "string"}},
     {"name": "install_package", "args": {"package": "string"}},
     {"name": "fetch_url", "args": {"url": "string"}},
     {"name": "web_search", "args": {"query": "string"}},
+    {"name": "git_diff", "args": {}},
 ]
 TOOL_NAMES = {t["name"] for t in TOOL_SCHEMA}
 
@@ -149,22 +151,37 @@ def os_package_manager():
     return None
 
 def normalize_content(s):
-    if not isinstance(s, str):
-        return s
-    s = s.replace('\\"', '"')
-    s = s.replace("\\'", "'")
-    s = s.replace("\\n", "\n")
-    s = s.replace("\\t", "\t")
-    s = s.replace("\\r", "\r")
-    s = s.replace("\\\\", "\\")
-    return s
+    if not isinstance(s, str): return s
+    return s.replace('\\"', '"').replace("\\'", "'").replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r").replace("\\\\", "\\")
 
 def call_tool(name, args):
     try:
+        if name == "git_diff":
+            if not which("git"):
+                return "ERROR: git не установлен."
+            r_check = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if r_check.returncode != 0 or "true" not in r_check.stdout.lower():
+                return "ERROR: текущая папка не является git-репозиторием."
+            
+            r_staged = subprocess.run(["git", "diff", "--cached", "--stat"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if r_staged.stdout.strip():
+                r = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+                header = "=== STAGED CHANGES (git diff --cached) ===\n"
+            else:
+                r = subprocess.run(["git", "diff"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+                header = "=== UNSTAGED CHANGES (git diff) ===\n"
+            
+            r_status = subprocess.run(["git", "status", "--short"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if not r.stdout.strip() and not r_status.stdout.strip():
+                return "Изменений нет. Рабочая директория чистая."
+            
+            out = header + (r.stdout or "") + "\n\n=== git status --short ===\n" + (r_status.stdout or "")
+            return smart_clip(out, LIMIT_SHELL_OUT)
+
         if name == "read_file":
             with open(args["path"], "r", encoding="utf-8", errors="replace") as f:
                 data = f.read()
-            return clip(data, LIMIT_READ_FILE)
+            return smart_clip(data, LIMIT_READ_FILE)
 
         if name == "write_file":
             path = args["path"]
@@ -184,25 +201,18 @@ def call_tool(name, args):
             else:
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(content)
-                with open(path, "r", encoding="utf-8") as f:
-                    total_size = len(f.read())
-                return f"OK: дописано {len(content)} символов в конец {path} (теперь всего {total_size} символов)"
+                return f"OK: дописано {len(content)} символов в конец {path}"
 
         if name == "insert_inside_class":
             path = args["path"]
             content = normalize_content(args["content"])
             with open(path, "r", encoding="utf-8") as f:
                 code = f.read()
-            
-            # Ищем последнюю закрывающую скобку класса
             last_brace_idx = code.rfind("}")
             if last_brace_idx == -1:
-                # Если скобок нет, просто дописываем в конец
                 with open(path, "a", encoding="utf-8") as f:
                     f.write("\n" + content)
                 return f"OK: скобок не найдено, код добавлен в конец файла {path}"
-            
-            # Вставляем контент перед последней скобкой
             new_code = code[:last_brace_idx] + "\n\n    " + content.replace("\n", "\n    ") + "\n" + code[last_brace_idx:]
             with open(path, "w", encoding="utf-8") as f:
                 f.write(new_code)
@@ -230,33 +240,24 @@ def call_tool(name, args):
         if name == "run_shell":
             cmd = args["command"]
             low = cmd.lower()
-            install_markers = ("apt-get install", "apt install", "yum install",
-                               "dnf install", "pacman -s", "brew install",
-                               "winget install", "choco install")
+            install_markers = ("apt-get install", "apt install", "yum install", "dnf install", "pacman -s", "brew install", "winget install", "choco install")
             if any(m in low for m in install_markers):
-                return ("ERROR: для установки используй инструмент install_package, "
-                        "а не run_shell.")
+                return ("ERROR: для установки используй инструмент install_package, а не run_shell.")
             print(Fore.YELLOW + f"  ⚠ Команда: {cmd}" + Style.RESET_ALL)
             if input(Fore.WHITE + "  Выполнить? (y/n): " + Style.RESET_ALL).strip().lower() != "y":
                 return "Отменено пользователем"
-            r = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True,
-                encoding="cp866" if IS_WINDOWS else "utf-8",
-                errors="replace", timeout=300,
-            )
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, encoding="cp866" if IS_WINDOWS else "utf-8", errors="replace", timeout=300)
             out = f"exit={r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
-            return clip(out, LIMIT_SHELL_OUT)
+            return smart_clip(out, LIMIT_SHELL_OUT)
 
         if name == "install_package":
             pkg = args["package"].strip()
             pm = os_package_manager()
             if pm is None:
-                return ("ERROR: на этой системе не найден пакетный менеджер "
-                        "(winget/choco/apt/dnf/pacman/brew). Установи пакет вручную.")
+                return ("ERROR: на этой системе не найден пакетный менеджер (winget/choco/apt/dnf/pacman/brew). Установи пакет вручную.")
             print(Fore.YELLOW + f"  ⚠ Установка через {pm}: {pkg}" + Style.RESET_ALL)
             if input(Fore.WHITE + "  Выполнить? (y/n): " + Style.RESET_ALL).strip().lower() != "y":
                 return "Отменено пользователем"
-
             if pm == "winget":
                 cmd = ["winget", "install", "--id", pkg, "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"]
             elif pm == "choco":
@@ -271,18 +272,15 @@ def call_tool(name, args):
                 cmd = ["brew", "install", pkg]
             else:
                 return f"ERROR: неизвестный пакетный менеджер {pm}"
-
             r = subprocess.run(cmd, capture_output=True, text=True, encoding="cp866" if IS_WINDOWS else "utf-8", errors="replace", timeout=900)
             refresh_path()
-            out = (f"exit={r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}\n"
-                   f"PATH обновлён в текущем процессе — проверь через which/where.")
-            return clip(out, LIMIT_INSTALL_OUT)
+            out = (f"exit={r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}\nPATH обновлён в текущем процессе — проверь через which/where.")
+            return smart_clip(out, LIMIT_INSTALL_OUT)
 
         if name == "fetch_url":
             url = args["url"].strip()
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
-            
             print(Fore.CYAN + f"  🌐 Загрузка: {url}" + Style.RESET_ALL)
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             try:
@@ -298,7 +296,15 @@ def call_tool(name, args):
                     text = soup.get_text(separator="\n")
                     lines = (line.strip() for line in text.splitlines())
                     text = "\n".join(line for line in lines if line)
-                return clip(text, LIMIT_WEB_OUT)
+                
+                if len(text) > 10000:
+                    with open("temp_page.txt", "w", encoding="utf-8") as f:
+                        f.write(text)
+                    return (f"Страница загружена, но она слишком большая ({len(text)} символов). "
+                            f"Текст сохранен в файл 'temp_page.txt'. "
+                            f"Используй read_file('temp_page.txt'), чтобы прочитать его.")
+                else:
+                    return text
             except Exception as e:
                 return f"ERROR: не удалось загрузить {url}. Причина: {e}"
 
@@ -345,7 +351,6 @@ def parse_model_json(text):
         for end in range(start + 1, len(s) + 1):
             if s[end - 1] != "}": continue
             chunk = s[start:end]
-            
             try:
                 obj = json.loads(chunk)
                 if isinstance(obj, dict):
@@ -366,32 +371,26 @@ def parse_model_json(text):
             except Exception:
                 pass
 
-            # Аварийный разбор ПЛОСКОГО формата
             match_flat = re.search(r'\{\s*"?(write_file|append_file|insert_inside_class)"?\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"(.*)', chunk, re.DOTALL)
             if match_flat:
                 tool_name = match_flat.group(1)
                 file_path = match_flat.group(2)
                 raw_content = match_flat.group(3)
-                
                 if raw_content.endswith('"}'): raw_content = raw_content[:-2]
                 elif raw_content.endswith('"'): raw_content = raw_content[:-1]
                 elif raw_content.endswith('"}}'): raw_content = raw_content[:-3]
                 else: raw_content = raw_content.rstrip('}"')
-
                 raw_content = raw_content.replace('\\n', '\n').replace('\\"', '"')
                 results.append(("tool", tool_name, {"path": file_path, "content": raw_content}))
                 break
 
-            # Аварийный разбор ВЛОЖЕННОГО формата
             match_nested = re.search(r'"tool"\s*:\s*"(write_file|append_file|insert_inside_class)"\s*,\s*"args"\s*:\s*\{\s*"path"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"(.*)', chunk, re.DOTALL)
             if match_nested:
                 tool_name = match_nested.group(1)
                 file_path = match_nested.group(2)
                 raw_content = match_nested.group(3)
-                
                 if not raw_content.endswith('"'): raw_content += '"'
                 if not chunk.endswith("}}"): chunk += "}}"
-                
                 try:
                     fixed_obj = json.loads(chunk)
                     if "args" in fixed_obj and "content" in fixed_obj["args"]:
@@ -399,14 +398,13 @@ def parse_model_json(text):
                         break
                 except Exception:
                     pass
-                
                 if raw_content.startswith('"'): raw_content = raw_content[1:]
                 raw_content = raw_content.replace('"}}', '').replace('"', '').replace('\\n', '\n')
                 results.append(("tool", tool_name, {"path": file_path, "content": raw_content}))
                 break
     return results
 
-# ---------- Многострочный ввод ----------
+# ---------- Ввод ----------
 
 TRIPLE = '"' * 3
 
@@ -478,11 +476,23 @@ def main():
         "СТРАТЕГИЯ НАПИСАНИЯ КОДА (СБОРКА КЛАССА):\n"
         "- Если код не помещается в один ответ, разбей его на логические блоки.\n"
         "- Шаг 1: Вызови write_file, чтобы создать класс с основной функцией. Обязательно поставь закрывающую скобку класса в конце.\n"
-        "- Шаг 2: Если нужны вспомогательные функции (например, fillRaw), вызови insert_inside_class с их кодом. Этот инструмент сам вставит код перед последней закрывающей скобкой.\n"
-        "- Шаг 3: Когда все функции написаны, ответь {\"answer\": \"Готово\"}.\n"
-        "- НИКОГДА не оставляй вызовы несуществующих функций. Если ты вызвал fillRaw в основной функции, ты ОБЯЗАН добавить её через insert_inside_class.\n\n"
+        "- Шаг 2: Если нужны вспомогательные функции, вызови insert_inside_class с их кодом.\n"
+        "- Шаг 3: Когда все функции написаны, ответь {\"answer\": \"Готово\"}.\n\n"
+        "ОБНОВЛЕНИЕ ДОКУМЕНТАЦИИ (README):\n"
+        "- Если пользователь просит обновить README, сначала вызови read_file('README.md'), чтобы прочитать текущий текст.\n"
+        "- Затем вызови read_file('windows_cli_giga_agent.py') или list_dir('.'), чтобы понять актуальные функции.\n"
+        "- После этого вызови write_file('README.md', ...) с обновлённым текстом. Не пересказывай изменения, а ПЕРЕЗАПИШИ файл.\n\n"
+        "РАБОТА С СЕТЬЮ:\n"
+        "- Используй web_search, чтобы найти ссылки, и fetch_url, чтобы прочитать страницу.\n"
+        "- Если fetch_url вернул сообщение, что текст сохранён в 'temp_page.txt', "
+        "используй read_file('temp_page.txt'), чтобы прочитать его.\n\n"
+        "РАБОТА С GIT:\n"
+        "- git_diff вызывай ТОЛЬКО когда пользователь явно просит 'коммит', 'commit', 'пуш', 'push', 'commit message'.\n"
+        "- НЕ вызывай git_diff, если пользователь просто просит обновить README или что-то изменить в коде.\n"
+        "- Если просят коммит — сначала git_diff, потом ответ с текстом коммита на русском языке.\n\n"
         "ЖЁСТКИЕ ПРАВИЛА ПРОТИВ ОТКАЗОВ:\n"
         "- ЗАПРЕЩЕНО отвечать 'уточни', 'предоставь', 'не могу', 'не хватает информации'.\n"
+        "- По умолчанию отвечай на русском языке.\n"
     )
 
     history = [Messages(role=MessagesRole.SYSTEM, content=system_prompt)]
@@ -560,7 +570,7 @@ def main():
                     color = Fore.RED if bad else Fore.GREEN
                     print(color + f"  [result] {clip(result, LIMIT_TOOL_PRINT)}" + Style.RESET_ALL)
                     
-                    history.append(Messages(role=MessagesRole.USER, content=f"Результат {name}: {clip(result, LIMIT_TOOL_TO_MODEL)}\nПродолжай."))
+                    history.append(Messages(role=MessagesRole.USER, content=f"Результат {name}: {smart_clip(result, LIMIT_TOOL_TO_MODEL)}\nПродолжай."))
                     did_tool = True
 
                     if name in ("write_file", "append_file", "insert_inside_class"):
@@ -572,7 +582,7 @@ def main():
                 
                 if wrote_chunk:
                     print(Fore.MAGENTA + f"  [конвейер] Ожидание продолжения..." + Style.RESET_ALL)
-                    history.append(Messages(role=MessagesRole.USER, content=f"Файл {last_file_path} сохранен. Если не хватает функций, добавь их через insert_inside_class (например, fillRaw). Если всё готово, ответь 'Готово'."))
+                    history.append(Messages(role=MessagesRole.USER, content=f"Файл {last_file_path} сохранен. Если не хватает функций, добавь их через insert_inside_class. Если всё готово, ответь 'Готово'."))
                     continue
                 
                 if did_tool:
